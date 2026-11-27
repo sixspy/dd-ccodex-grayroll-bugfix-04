@@ -1,4 +1,4 @@
-"""灰度规则只读与影子绑定（乙路径草案）。"""
+"""灰度规则只读与影子绑定（乙路径草案；升正按甲口径同事务关闭草稿口）。"""
 from __future__ import annotations
 
 import time
@@ -6,10 +6,16 @@ import time
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from audit_svc import write_audit, write_history
+from audit_svc import (
+    count_audit,
+    count_history,
+    last_promoter,
+    write_audit,
+    write_history,
+)
 from auth import current_user, require_writer
 from db import connect
-from locks import acquire, release
+from locks import acquire, add_contention_mark, release
 from policies import assert_flag_publishable, assert_not_killed_or_allow_kill, describe_path
 from validators import require_int, require_percent, require_rule_kind
 
@@ -61,7 +67,7 @@ def shadow_bind(body: ShadowBindIn, authorization: str | None = Header(default=N
     pct = require_percent(body.percent)
     key = f"flag-rule:{fid}:{eid}"
     with connect() as conn:
-        acquire(conn, key, user["username"])
+        token = acquire(conn, key, user["username"])
         try:
             fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
             if not fl:
@@ -86,43 +92,139 @@ def shadow_bind(body: ShadowBindIn, authorization: str | None = Header(default=N
             conn.commit()
             return {"mode": "shadow", "id": sid, "path": describe_path("cohort_bind", True)}
         finally:
-            release(conn, key, user["username"])
+            release(conn, key, token)
             conn.commit()
+
+
+def _cross_check_rule_promotion(conn, shadow_id: int, fid: int, eid: int, ver: int, sh) -> None:
+    """同事务联查跨表账实：正式区恰好一套、草稿口已 promoted、两边字段/版本一致、审计 exactly-once。"""
+    n_official = conn.execute(
+        "SELECT COUNT(*) c FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1",
+        (fid, eid),
+    ).fetchone()["c"]
+    if n_official != 1:
+        raise RuntimeError(f"升正账实不符：正式规则数={n_official}，应为 1")
+
+    row = conn.execute(
+        """
+        SELECT r.version AS rv, r.kind AS rk, r.percent AS rp, r.cohort_id AS rc,
+               s.kind AS sk, s.percent AS sp, s.cohort_id AS sc, s.status AS ss
+        FROM flag_rules r
+        JOIN rule_shadows s ON s.id=?
+        WHERE r.flag_id=? AND r.env_id=? AND r.official=1
+        """,
+        (shadow_id, fid, eid),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError("升正账实不符：联查不到正式规则↔草稿口记录")
+    if row["ss"] != "promoted" or row["rv"] != ver:
+        raise RuntimeError("升正账实不符：草稿口状态或版本不一致")
+    if row["rk"] != sh["kind"] or int(row["rp"]) != int(sh["percent"]):
+        raise RuntimeError("升正账实不符：正式规则类型/比例与草稿不一致")
+    if (row["rc"] if row["rc"] is not None else None) != (
+        sh["cohort_id"] if sh["cohort_id"] is not None else None
+    ):
+        raise RuntimeError("升正账实不符：正式规则人群与草稿不一致")
+    if count_audit(conn, "rule_promote", f"from_shadow={shadow_id}") != 1:
+        raise RuntimeError("升正审计不是 exactly-once")
+    if count_history(conn, "rule_promote", fid, eid) < 1:
+        raise RuntimeError("升正变更历史未在同事务落账")
 
 
 @router.post("/shadow/{shadow_id}/promote")
 def promote_rule_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+    """甲口径：升正写正式 与 同事务关闭草稿口 必须同时成立，否则整体回滚。
+
+    并发同草稿口：原子条件 UPDATE（open->promoted, rowcount=1）作为核销点，
+    败方拿 409 且只留一段争用痕，绝不二次落正式。
+    """
     user = current_user(authorization)
     require_writer(user)
-    with connect() as conn:
+    conn = connect()
+    key: str | None = None
+    token: str | None = None
+    try:
         sh = conn.execute("SELECT * FROM rule_shadows WHERE id=?", (shadow_id,)).fetchone()
-        if not sh or sh["status"] != "open":
-            raise HTTPException(400, detail="影子绑定不可升正")
+        if not sh:
+            raise HTTPException(404, detail="影子绑定不存在")
         fid, eid = sh["flag_id"], sh["env_id"]
         key = f"flag-rule:{fid}:{eid}"
-        acquire(conn, key, user["username"])
-        try:
-            now = time.time()
-            old = conn.execute(
-                "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
-            ).fetchone()
-            ver = (old["version"] + 1) if old else 1
-            if old:
-                conn.execute("DELETE FROM flag_rules WHERE id=?", (old["id"],))
-            cur = conn.execute(
-                "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
-                "VALUES(?,?,?,?,?,?,1,?)",
-                (fid, eid, sh["kind"], sh["percent"], sh["cohort_id"], ver, now),
+
+        # 同草稿口 / 同格升正互斥锁；抢锁失败直接 409 + 争用痕。
+        token = acquire(conn, key, user["username"])
+
+        # 权威核销：只有仍 open 且条件更新命中 1 行的一路是赢家。
+        claim = conn.execute(
+            "UPDATE rule_shadows SET status='promoted' WHERE id=? AND status='open'",
+            (shadow_id,),
+        )
+        if claim.rowcount != 1:
+            winner = last_promoter(conn, shadow_id) or "committed-winner"
+            add_contention_mark(conn, key, user["username"], winner)
+            conn.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="草稿口已被消耗：该影子规则已升正，禁止二次落正式",
             )
-            rid = cur.lastrowid
-            # BUGFIX-04 埋雷：升正后影子仍 open，可二次升正
-            # conn.execute("UPDATE rule_shadows SET status='promoted' WHERE id=?", (shadow_id,))
-            if conn.execute("SELECT status FROM flags WHERE id=?", (fid,)).fetchone()["status"] == "draft":
-                conn.execute("UPDATE flags SET status='active' WHERE id=?", (fid,))
-            write_history(conn, user["username"], "rule_promote", f"影子规则升正 v{ver}", flag_id=fid, env_id=eid)
-            write_audit(conn, user["username"], "rule_promote", "flag_rule", rid, f"from_shadow={shadow_id}")
-            conn.commit()
-            return {"id": rid, "version": ver, "mode": "official"}
-        finally:
-            release(conn, key, user["username"])
-            conn.commit()
+
+        fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
+        if not fl:
+            raise HTTPException(404, detail="开关不存在")
+        if not conn.execute("SELECT 1 FROM environments WHERE id=?", (eid,)).fetchone():
+            raise HTTPException(404, detail="环境不存在")
+
+        now = time.time()
+        old = conn.execute(
+            "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1 "
+            "ORDER BY version DESC, id DESC LIMIT 1",
+            (fid, eid),
+        ).fetchone()
+        ver = (old["version"] + 1) if old else 1
+        # 健康库仅一行；按格清空旧正式，避免双正式撞唯一键 / 残留。
+        conn.execute(
+            "DELETE FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1",
+            (fid, eid),
+        )
+        cur = conn.execute(
+            "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
+            "VALUES(?,?,?,?,?,?,1,?)",
+            (fid, eid, sh["kind"], sh["percent"], sh["cohort_id"], ver, now),
+        )
+        rid = cur.lastrowid
+        if cur.rowcount != 1 or not rid:
+            raise RuntimeError("正式规则零增：回滚升正与草稿口关闭")
+
+        if fl["status"] == "draft":
+            conn.execute("UPDATE flags SET status='active' WHERE id=?", (fid,))
+
+        write_history(conn, user["username"], "rule_promote", f"影子规则升正 v{ver}", flag_id=fid, env_id=eid)
+        write_audit(conn, user["username"], "rule_promote", "flag_rule", rid, f"from_shadow={shadow_id}")
+
+        # 同事务联查跨表账实；不过则抛错回滚，草稿口不会被消耗。
+        _cross_check_rule_promotion(conn, shadow_id, fid, eid, ver, sh)
+
+        conn.commit()
+        return {
+            "id": rid,
+            "version": ver,
+            "mode": "official",
+            "draft_status": "promoted",
+            "gate_closed": True,
+            "consumed": True,
+            "official_count": 1,
+            "cross_check": "ok",
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if key is not None and token is not None:
+            try:
+                release(conn, key, token)
+                conn.commit()
+            except Exception:
+                pass
+        conn.close()

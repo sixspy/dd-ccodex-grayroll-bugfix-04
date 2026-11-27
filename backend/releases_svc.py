@@ -1,4 +1,4 @@
-"""发布生效：默认甲路径同事务写正式配置；use_shadow 走乙路径。"""
+"""发布生效：默认甲路径同事务写正式配置；use_shadow 走乙路径，升正原子核销草稿口。"""
 from __future__ import annotations
 
 import time
@@ -6,10 +6,10 @@ import time
 from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
-from audit_svc import write_audit, write_history
+from audit_svc import count_audit, count_history, last_promoter, write_audit, write_history
 from auth import current_user, require_writer
 from db import connect
-from locks import acquire, release
+from locks import acquire, add_contention_mark, release
 from policies import assert_flag_publishable, assert_not_killed_or_allow_kill, describe_path
 from validators import require_int, require_percent, require_rule_kind, require_str
 
@@ -59,7 +59,7 @@ def publish(body: PublishIn, authorization: str | None = Header(default=None)):
     summary = require_str(body.summary, "发布说明", 4)
     key = f"flag-release:{fid}:{eid}"
     with connect() as conn:
-        acquire(conn, key, user["username"])
+        token = acquire(conn, key, user["username"])
         try:
             fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
             if not fl:
@@ -86,11 +86,15 @@ def publish(body: PublishIn, authorization: str | None = Header(default=None)):
                 return {"mode": "shadow", "id": sid, "path": describe_path("release", True)}
 
             old = conn.execute(
-                "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
+                "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1 "
+                "ORDER BY version DESC, id DESC LIMIT 1",
+                (fid, eid),
             ).fetchone()
             ver = (old["version"] + 1) if old else 1
-            if old:
-                conn.execute("DELETE FROM flag_rules WHERE id=?", (old["id"],))
+            conn.execute(
+                "DELETE FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1",
+                (fid, eid),
+            )
             conn.execute(
                 "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
                 "VALUES(?,?,?,?,?,?,1,?)",
@@ -109,50 +113,117 @@ def publish(body: PublishIn, authorization: str | None = Header(default=None)):
             conn.commit()
             return {"mode": "official", "id": rid, "version": ver, "path": describe_path("release", False)}
         finally:
-            release(conn, key, user["username"])
+            release(conn, key, token)
             conn.commit()
 
 
 @router.post("/shadow/{shadow_id}/promote")
 def promote_release_shadow(shadow_id: int, authorization: str | None = Header(default=None)):
+    """乙路径升正：原子核销发布草稿口，并同事务落正式规则 + releases + 历史/审计。"""
     user = current_user(authorization)
     require_writer(user)
-    with connect() as conn:
+    conn = connect()
+    key: str | None = None
+    token: str | None = None
+    try:
         sh = conn.execute("SELECT * FROM release_shadows WHERE id=?", (shadow_id,)).fetchone()
-        if not sh or sh["status"] != "open":
-            raise HTTPException(400, detail="影子发布不可升正")
+        if not sh:
+            raise HTTPException(404, detail="影子发布不存在")
         fid, eid = sh["flag_id"], sh["env_id"]
         key = f"flag-release:{fid}:{eid}"
-        acquire(conn, key, user["username"])
-        try:
-            fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
-            assert_flag_publishable(fl["status"])
-            assert_not_killed_or_allow_kill(fl["status"])
-            now = time.time()
-            old = conn.execute(
-                "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1", (fid, eid)
-            ).fetchone()
-            ver = (old["version"] + 1) if old else 1
-            if old:
-                conn.execute("DELETE FROM flag_rules WHERE id=?", (old["id"],))
-            conn.execute(
-                "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
-                "VALUES(?,?,?,?,?,?,1,?)",
-                (fid, eid, sh["kind"], sh["percent"], sh["cohort_id"], ver, now),
-            )
-            cur = conn.execute(
-                "INSERT INTO releases(flag_id, env_id, version, summary, status, official, published_at, published_by) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (fid, eid, ver, sh["summary"], "published", 1, now, user["username"]),
-            )
-            rid = cur.lastrowid
-            conn.execute("UPDATE release_shadows SET status='promoted' WHERE id=?", (shadow_id,))
-            if fl["status"] in ("draft", "killed"):
-                conn.execute("UPDATE flags SET status='active' WHERE id=?", (fid,))
-            write_history(conn, user["username"], "release_promote", f"影子升正 v{ver}", flag_id=fid, env_id=eid)
-            write_audit(conn, user["username"], "release_promote", "release", rid, f"from_shadow={shadow_id}")
+
+        token = acquire(conn, key, user["username"])
+
+        claim = conn.execute(
+            "UPDATE release_shadows SET status='promoted' WHERE id=? AND status='open'",
+            (shadow_id,),
+        )
+        if claim.rowcount != 1:
+            winner = last_promoter(conn, shadow_id) or "committed-winner"
+            add_contention_mark(conn, key, user["username"], winner)
             conn.commit()
-            return {"id": rid, "version": ver, "mode": "official"}
-        finally:
-            release(conn, key, user["username"])
-            conn.commit()
+            raise HTTPException(
+                status_code=409,
+                detail="草稿口已被消耗：该影子发布已升正，禁止二次落正式",
+            )
+
+        fl = conn.execute("SELECT * FROM flags WHERE id=?", (fid,)).fetchone()
+        assert_flag_publishable(fl["status"])
+        assert_not_killed_or_allow_kill(fl["status"])
+        now = time.time()
+        old = conn.execute(
+            "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1 "
+            "ORDER BY version DESC, id DESC LIMIT 1",
+            (fid, eid),
+        ).fetchone()
+        ver = (old["version"] + 1) if old else 1
+        conn.execute(
+            "DELETE FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1",
+            (fid, eid),
+        )
+        rcur = conn.execute(
+            "INSERT INTO flag_rules(flag_id, env_id, kind, percent, cohort_id, version, official, updated_at) "
+            "VALUES(?,?,?,?,?,?,1,?)",
+            (fid, eid, sh["kind"], sh["percent"], sh["cohort_id"], ver, now),
+        )
+        if rcur.rowcount != 1:
+            raise RuntimeError("正式规则零增：回滚发布升正与草稿口关闭")
+        cur = conn.execute(
+            "INSERT INTO releases(flag_id, env_id, version, summary, status, official, published_at, published_by) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (fid, eid, ver, sh["summary"], "published", 1, now, user["username"]),
+        )
+        rid = cur.lastrowid
+        if cur.rowcount != 1 or not rid:
+            raise RuntimeError("正式发布零增：回滚")
+        if fl["status"] in ("draft", "killed"):
+            conn.execute("UPDATE flags SET status='active' WHERE id=?", (fid,))
+        write_history(conn, user["username"], "release_promote", f"影子升正 v{ver}", flag_id=fid, env_id=eid)
+        write_audit(conn, user["username"], "release_promote", "release", rid, f"from_shadow={shadow_id}")
+
+        # 跨表账实联查。
+        if conn.execute(
+            "SELECT COUNT(*) c FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1",
+            (fid, eid),
+        ).fetchone()["c"] != 1:
+            raise RuntimeError("账实不符：正式规则不唯一")
+        if conn.execute(
+            "SELECT COUNT(*) c FROM releases WHERE id=? AND official=1 AND status='published' AND version=?",
+            (rid, ver),
+        ).fetchone()["c"] != 1:
+            raise RuntimeError("账实不符：正式发布缺失")
+        gate = conn.execute(
+            "SELECT status FROM release_shadows WHERE id=?", (shadow_id,)
+        ).fetchone()["status"]
+        if gate != "promoted":
+            raise RuntimeError("账实不符：发布草稿口未关闭")
+        if count_audit(conn, "release_promote", f"from_shadow={shadow_id}") != 1:
+            raise RuntimeError("发布升正审计不是 exactly-once")
+        if count_history(conn, "release_promote", fid, eid) < 1:
+            raise RuntimeError("发布升正变更历史未在同事务落账")
+
+        conn.commit()
+        return {
+            "id": rid,
+            "version": ver,
+            "mode": "official",
+            "draft_status": "promoted",
+            "gate_closed": True,
+            "consumed": True,
+            "official_count": 1,
+            "cross_check": "ok",
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        if key is not None and token is not None:
+            try:
+                release(conn, key, token)
+                conn.commit()
+            except Exception:
+                pass
+        conn.close()

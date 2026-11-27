@@ -94,3 +94,16 @@ table code { font-size: 0.8rem; color: var(--accent); }
 .stat.danger { color: var(--danger); }
 .footer-note { margin-top: 1rem; font-size: 0.78rem; color: var(--muted); }
 .matrix-empty { color: var(--muted); }
+
+/* gbf04 草稿口状态徽标与账实冲突行 */
+.badge {
+  display: inline-block; padding: 0.12rem 0.55rem; border-radius: 999px;
+  font-size: 0.74rem; border: 1px solid var(--line); white-space: nowrap;
+}
+.badge.ok { background: rgba(123,216,143,0.14); color: var(--ok); border-color: rgba(123,216,143,0.4); }
+.badge.warn { background: rgba(240,180,41,0.15); color: var(--warn); border-color: rgba(240,180,41,0.4); }
+.badge.bad { background: rgba(240,113,120,0.16); color: var(--danger); border-color: rgba(240,113,120,0.45); }
+.badge.muted { background: rgba(147,160,184,0.12); color: var(--muted); }
+tr.row-consumed td { opacity: 0.62; }
+tr.row-conflict { background: rgba(240,113,120,0.08); }
+tr.row-conflict td { border-bottom-color: rgba(240,113,120,0.35); }

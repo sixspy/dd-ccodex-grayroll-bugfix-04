@@ -57,6 +57,7 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
         for field in ("kind", "percent", "cohort_id"):
             if official[field] != sh.get(field):
                 diffs.append({"field": field, "official": official[field], "shadow": sh.get(field)})
+    has_pending = bool(rule_shadows or release_shadows or kill_shadows)
     return {
         "flag": dict(fl),
         "env": dict(env),
@@ -66,9 +67,9 @@ def compare_flag_env(flag_id: int, env_id: int, authorization: str | None = Head
         "open_kill_shadows": kill_shadows,
         "recent_releases": recent_releases,
         "diffs": diffs,
-        "has_pending_shadow": bool(rule_shadows or release_shadows or kill_shadows),
-        # BUGFIX-04 埋雷：对比页把仍 open 影子当已升正假绿
-        "shadow_promoted_ok": True,
+        "has_pending_shadow": has_pending,
+        # gbf04：不再硬编码 True 制造“仍 open 却已升正”的假绿；没有开放草稿口才视为关口已闭。
+        "shadow_promoted_ok": not has_pending,
     }
 
 

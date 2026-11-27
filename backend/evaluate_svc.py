@@ -61,10 +61,24 @@ def evaluate(body: EvalIn, authorization: str | None = Header(default=None)):
                 "subject_key": subject,
                 "version": None,
             }
-        rule = conn.execute(
-            "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1",
+        # 不能裸 fetchone()：一旦账上异常存在双正式版本，无 ORDER BY 会随 rowid
+        # 取到旧版，两个互相矛盾的断言会各绿各的（gbf04 假绿）。这里全量取出，
+        # 确定性选最高版本（同版本取最大 id）为 canonical，并如实上报冲突。
+        rules = conn.execute(
+            "SELECT * FROM flag_rules WHERE flag_id=? AND env_id=? AND official=1 "
+            "ORDER BY version DESC, id DESC",
             (fl["id"], env["id"]),
-        ).fetchone()
+        ).fetchall()
+        official_count = len(rules)
+        dual_official = official_count > 1
+        consistency = {
+            "official_count": official_count,
+            "consistent": official_count <= 1,
+            "dual_official": dual_official,
+            "conflict": "multiple_official_versions" if dual_official else None,
+            "official_versions": [int(r["version"]) for r in rules],
+        }
+        rule = rules[0] if rules else None
         if not rule:
             return {
                 "enabled": False,
@@ -72,6 +86,7 @@ def evaluate(body: EvalIn, authorization: str | None = Header(default=None)):
                 "flag_key": flag_key,
                 "env_code": env_code,
                 "subject_key": subject,
+                **consistency,
             }
         percent_hit = eval_percent(subject, int(rule["percent"]), flag_key)
         cohort_hit = False
@@ -94,6 +109,7 @@ def evaluate(body: EvalIn, authorization: str | None = Header(default=None)):
             "flag_key": flag_key,
             "env_code": env_code,
             "subject_key": subject,
+            **consistency,
         }
 
 
@@ -102,16 +118,18 @@ def eval_board(authorization: str | None = Header(default=None)):
     """总览：各环境正式规则摘要。"""
     current_user(authorization)
     with connect() as conn:
-        rows = [
+        raw_rows = [
             dict(r)
             for r in conn.execute(
                 """
-                SELECT f.key AS flag_key, f.status, e.code AS env_code, r.kind, r.percent, r.version, r.cohort_id
+                SELECT f.id AS flag_id, e.id AS env_id,
+                       f.key AS flag_key, f.status, e.code AS env_code,
+                       r.kind, r.percent, r.version, r.cohort_id
                 FROM flag_rules r
                 JOIN flags f ON f.id=r.flag_id
                 JOIN environments e ON e.id=r.env_id
                 WHERE r.official=1
-                ORDER BY f.key, e.risk_level
+                ORDER BY f.key, e.risk_level, r.version DESC, r.id DESC
                 """
             ).fetchall()
         ]
@@ -119,4 +137,42 @@ def eval_board(authorization: str | None = Header(default=None)):
             dict(x)
             for x in conn.execute("SELECT status, COUNT(*) c FROM flags GROUP BY status").fetchall()
         ]
-    return {"rules": rows, "by_status": by_status}
+
+    # 同一 (flag, env) 若有多行 official=1，只暴露 canonical（最高版本），
+    # 同时把冲突单列出来，禁止 board 用两行互相打架的“绿”掩盖账实不符。
+    grouped: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    for row in raw_rows:
+        k = (row["flag_key"], row["env_code"])
+        if k not in grouped:
+            grouped[k] = {"canonical": row, "versions": []}
+            order.append(k)
+        grouped[k]["versions"].append(int(row["version"]))
+
+    rules = []
+    conflicts = []
+    for k in order:
+        g = grouped[k]
+        canonical = dict(g["canonical"])
+        versions = g["versions"]
+        count = len(versions)
+        canonical["official_count"] = count
+        canonical["consistent"] = count <= 1
+        rules.append(canonical)
+        if count > 1:
+            conflicts.append(
+                {
+                    "flag_key": k[0],
+                    "env_code": k[1],
+                    "official_count": count,
+                    "versions": versions,
+                    "canonical_version": canonical["version"],
+                    "conflict": "multiple_official_versions",
+                }
+            )
+    return {
+        "rules": rules,
+        "by_status": by_status,
+        "conflicts": conflicts,
+        "official_conflict_count": len(conflicts),
+    }

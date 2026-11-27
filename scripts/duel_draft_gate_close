@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# duel_draft_gate_close —— 并发双请求决斗同草稿口升正互斥（包装器）。
+# 用法: scripts/duel_draft_gate_close [--base-url http://127.0.0.1:8020] [--gate rule|release] [--rounds N]
+# 不带 --base-url 时等价于 --selftest（临时库自起服务真并发决斗）。
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${PYTHON:-}" ]; then
+  PY="$PYTHON"
+elif [ -x "$DIR/../.venv/bin/python" ]; then
+  PY="$DIR/../.venv/bin/python"
+else
+  PY="python3"
+fi
+if [ "$#" -eq 0 ]; then
+  exec "$PY" "$DIR/duel_draft_gate_close.py" --selftest
+else
+  exec "$PY" "$DIR/duel_draft_gate_close.py" "$@"
+fi

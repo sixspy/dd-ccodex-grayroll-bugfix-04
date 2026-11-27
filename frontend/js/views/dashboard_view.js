@@ -22,7 +22,10 @@ export const DashboardView = {
     </div>
     <div class="panel span-4" v-if="data"><div class="muted">开关数</div><p class="stat">{{ data.flags }}</p></div>
     <div class="panel span-4" v-if="data"><div class="muted">已生效</div><p class="stat">{{ data.active }}</p></div>
-    <div class="panel span-4" v-if="data"><div class="muted">开放影子</div><p class="stat">{{ data.open_shadows }}</p></div>
+    <div class="panel span-4" v-if="data"><div class="muted">开放草稿口（规则/发布/熔断）</div><p class="stat">{{ data.open_draft_gates ?? data.open_shadows }}</p>
+      <p class="muted" style="font-size:12px">规则 {{ data.open_rule_shadows ?? 0 }} · 发布 {{ data.open_release_shadows ?? 0 }} · 熔断 {{ data.open_kill_shadows ?? 0 }}</p>
+    </div>
+    <div class="panel span-4" v-if="data"><div class="muted">争用痕（败方留痕）</div><p class="stat">{{ data.contention_marks ?? 0 }}</p></div>
     <div class="panel span-6" v-if="data">
       <h2>状态分布</h2>
       <table><thead><tr><th>状态</th><th>数量</th></tr></thead>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -9,7 +10,8 @@ from models import DOMAIN, PRODUCT_NAME, SKELETON, SUB_DIRECTION, USERS
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
-DB_PATH = DATA / "app.db"
+# 允许用环境变量指定独立账库（并发决斗脚本 / 隔离测试用）；缺省仍是 data/app.db。
+DB_PATH = Path(os.environ.get("GRAYROLL_DB_PATH", str(DATA / "app.db")))
 FIXTURES = ROOT / "fixtures"
 FRONTEND = ROOT / "frontend"
 
@@ -23,7 +25,7 @@ PRODUCT_META = {
 
 def connect() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
@@ -154,6 +156,7 @@ CREATE TABLE IF NOT EXISTS audit_log(
 CREATE TABLE IF NOT EXISTS row_locks(
   lock_key TEXT PRIMARY KEY,
   holder TEXT NOT NULL,
+  owner_token TEXT,
   expires_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS contention_marks(
@@ -279,8 +282,16 @@ def seed(conn: sqlite3.Connection) -> None:
     conn.execute("INSERT INTO experiment_bridge_stub(id, note) VALUES(1, ?)", ("实验平台桥接空桩未接通",))
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对已落盘的旧库做幂等补列（CREATE TABLE IF NOT EXISTS 不会改旧表）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(row_locks)").fetchall()}
+    if "owner_token" not in cols:
+        conn.execute("ALTER TABLE row_locks ADD COLUMN owner_token TEXT")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         seed(conn)
         conn.commit()
